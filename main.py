@@ -22,4 +22,7 @@ if __name__ == '__main__':
         # v_sim_setting_path='customized_v_sim_setting_file_path',
     )
     Generator.generate_dataset(config, p_net=False, v_nets=False, save=False)
-    run(config)
+    run(config) 
+
+    #conda activate nfv-env
+    # source nfv-env/bin/activate
