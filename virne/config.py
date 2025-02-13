@@ -66,11 +66,11 @@ class Config(ClassDict):
     use_cuda: bool = True
     cuda_id: int = 0
     distributed_training: bool = False
-    num_train_epochs: int = 3 #changed by me was 100
-    num_workers: int = 1 #changed by me was 10
+    num_train_epochs: int = 100 #changed by me was 100
+    num_workers: int = 10 #changed by me was 10
     batch_size: int = 128
     target_steps: int = batch_size * 2
-    repeat_times: int = 1 #changed by me was 10
+    repeat_times: int = 10 #changed by me was 10
     save_interval: int = 10
     eval_interval: int = 10
 

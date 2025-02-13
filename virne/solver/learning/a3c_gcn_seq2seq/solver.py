@@ -190,14 +190,29 @@ def obs_as_tensor(obs, device):
         # Pad sequences with zeros and get the mask of padded elements
         sequences = encoder_outputs_list
         max_length = max([seq.shape[0] for seq in sequences])
-        padded_sequences = np.zeros((len(sequences), max_length, sequences[0].shape[1]))
-        mask = np.zeros((len(sequences), max_length), dtype='bool')
-        for i, seq in enumerate(sequences):
-            seq_len = seq.shape[0]
-            padded_sequences[i, :seq_len, :] = seq
-            mask[i, :seq_len] = 1
-        obs_encoder_outputs = torch.FloatTensor(np.array(padded_sequences)).to(device)
-        obs_mask = torch.FloatTensor(mask).to(device)
+        feat_dim    = sequences[0].shape[1]
+
+        padded_sequences = torch.zeros(
+            (len(sequences), max_length, feat_dim),
+            device=device,
+            dtype=torch.float32
+        )
+        mask = torch.zeros(
+            (len(sequences), max_length),
+            device=device,
+            dtype=torch.bool
+        )
+
+        # Fill the padded sequences
+        for i, seq in enumerate(sequences): 
+            seq = torch.from_numpy(seq).float().to(device)  
+            seq_len = seq.shape[0]  # Now should be 8  
+            padded_sequences[i, :seq_len, :] = seq  # Assign correctly
+            mask[i, :seq_len] = True  # Set mask
+
+        obs_encoder_outputs = padded_sequences
+        obs_mask = mask
+
         return {
             'p_net': obs_p_net,
             'p_node_id': obs_p_node_id, 
