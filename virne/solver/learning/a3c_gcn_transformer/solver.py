@@ -1,8 +1,6 @@
 # ==============================================================================
-# Copyright 2023 GeminiLight (wtfly2018@gmail.com). All Rights Reserved.
+# solver.py (Refactored for Autoregressive Transformer)
 # ==============================================================================
-
-
 import os
 import torch
 import numpy as np
@@ -15,7 +13,7 @@ from torch.nn.utils.rnn import pad_sequence, pad_packed_sequence
 from virne.base import Solution, SolutionStepEnvironment
 from virne.solver import registry
 from .instance_env import InstanceEnv
-from .net import ActorCritic, Actor, Critic
+from .net import ActorCritic
 from virne.solver.learning.rl_base import RLSolver, PPOSolver, InstanceAgent, A2CSolver, RolloutBuffer
 from ..utils import get_pyg_data
 
@@ -28,214 +26,223 @@ class A3CGcnTransformerSolver(InstanceAgent, A2CSolver):
     """
     A Reinforcement Learning-based solver that uses 
     Advantage Actor-Critic (A3C) as the training algorithm,
-    and Graph Convolutional Network (GCN) and Transformer
-    as the neural network model.
-
-    References:
-        - Tianfu Wang, et al. "DRL-SFCP: Adaptive Service Function Chains Placement with Deep Reinforcement Learning". In ICC, 2021.
-        
+    with a Transformer-based architecture.
     """
     def __init__(self, controller, recorder, counter, **kwargs):
         InstanceAgent.__init__(self, InstanceEnv)
         A2CSolver.__init__(self, controller, recorder, counter, make_policy, obs_as_tensor, **kwargs)
         self.preprocess_encoder_obs = encoder_obs_to_tensor
 
+        # Decide on a special start token (or padding token).
+        # We'll treat p_net.num_nodes as <start_token>, and p_net.num_nodes+1 as <pad_token>, etc.
+        # This depends on how you want to set it up, but we’ll keep it simple here:
+        self.start_token_offset = 0  # We’ll just use p_net.num_nodes as start token.
+
     def solve(self, instance):
+        """Inference-only solve: uses a greedy or sample-based approach with the learned policy."""
         v_net, p_net = instance['v_net'], instance['p_net']
         sub_env = self.InstanceEnv(p_net, v_net, self.controller, self.recorder, self.counter, **self.basic_config)
+
+        # 1) Encode the virtual network once. 
         encoder_obs = sub_env.get_observation()
-        instance_done = False
         encoder_outputs = self.policy.encode(self.preprocess_encoder_obs(encoder_obs, device=self.device))
-        p_node_id = p_net.num_nodes
+
+        # 2) Maintain a partial action sequence for the Transformer.
+        #    We use [start_token] = p_net.num_nodes if you like. 
+        #    Each step we append the new action.
+        history_actions = [p_net.num_nodes + self.start_token_offset]  # <start_token>
+
+        instance_done = False
         while not instance_done:
-            instance_obs = encoder_obs
-            #hidden_state = self.policy.get_last_rnn_state() #Removed, because we are using Transformer now.
+            # Create the observation dict for the next decision:
             instance_obs = {
-                'p_node_id': p_node_id,
-                #'hidden_state': np.squeeze(hidden_state.cpu().detach().numpy(), axis=0), #Remove
-                'encoder_outputs': encoder_outputs,
-                'p_net_x': instance_obs['p_net_x'],
-                'p_net_edge_index': instance_obs['p_net_edge_index'],
-                'action_mask': np.expand_dims(sub_env.generate_action_mask(), axis=0),
+                'p_net_x'           : encoder_obs['p_net_x'],
+                'p_net_edge_index'  : encoder_obs['p_net_edge_index'],
+                'history_actions'   : np.array(history_actions, dtype=np.int64),  # shape (t,)
+                'encoder_outputs'   : encoder_outputs,
+                'action_mask'       : np.expand_dims(sub_env.generate_action_mask(), axis=0)
             }
             tensor_instance_obs = self.preprocess_obs(instance_obs, device=self.device)
-            action, action_logprob = self.select_action(tensor_instance_obs, sample=True)
-            next_instance_obs, instance_reward, instance_done, instance_info = sub_env.step(action)
 
-            p_node_id = action
+            # Select next action
+            action, action_logprob = self.select_action(tensor_instance_obs, sample=True)
+            next_obs, reward, instance_done, info = sub_env.step(action)
+
+            # Append chosen action to the partial sequence
+            history_actions.append(action)
 
             if instance_done:
                 break
 
-            instance_obs = next_instance_obs
+            encoder_obs = next_obs  # If your v_net_x changes each step, re-encode if needed.
+
         return sub_env.solution
 
     def learn_with_instance(self, instance):
-        # sub env for sub agent
+        """Collect one trajectory (sub-episode) from this instance and store it in the buffer."""
         sub_buffer = RolloutBuffer()
         v_net, p_net = instance['v_net'], instance['p_net']
         sub_env = self.InstanceEnv(p_net, v_net, self.controller, self.recorder, self.counter, **self.basic_config)
+
+        # Encode once
         encoder_obs = sub_env.get_observation()
-        instance_done = False
         encoder_outputs = self.policy.encode(self.preprocess_encoder_obs(encoder_obs, device=self.device))
-        #encoder_outputs = encoder_outputs.squeeze(1).cpu().detach().numpy()  #Remove squeeze. Transformer gives output for each token.
-        p_node_id = p_net.num_nodes
-        #hidden_state = self.policy.get_last_rnn_state()   #Transformer does not need hidden state.
-        instance_obs = {
-            'p_node_id': p_node_id,
-            #'hidden_state': hidden_state.squeeze(0).cpu().detach().numpy(), #Remove
-            'encoder_outputs': encoder_outputs,
-            'p_net_x': encoder_obs['p_net_x'],
-            'p_net_edge_index': encoder_obs['p_net_edge_index'],
-            'action_mask': np.expand_dims(sub_env.generate_action_mask(), axis=0)
-        }
+
+        # Start partial sequence with a <start_token>
+        history_actions = [p_net.num_nodes + self.start_token_offset]
+
+        instance_done = False
         while not instance_done:
-            #hidden_state = self.policy.get_last_rnn_state()  #Removed, because we are using Transformer now.
+            # Build observation
+            instance_obs = {
+                'p_net_x'           : encoder_obs['p_net_x'],
+                'p_net_edge_index'  : encoder_obs['p_net_edge_index'],
+                'history_actions'   : np.array(history_actions, dtype=np.int64),
+                'encoder_outputs'   : encoder_outputs,
+                'action_mask'       : np.expand_dims(sub_env.generate_action_mask(), axis=0)
+            }
             tensor_instance_obs = self.preprocess_obs(instance_obs, device=self.device)
+
+            # Pick action
             action, action_logprob = self.select_action(tensor_instance_obs, sample=True)
             value = self.estimate_value(tensor_instance_obs) if hasattr(self.policy, 'evaluate') else None
-            next_instance_obs, instance_reward, instance_done, instance_info = sub_env.step(action)
 
-            sub_buffer.add(instance_obs, action, instance_reward, instance_done, action_logprob, value=value)
+            # Step env
+            next_obs, reward, instance_done, info = sub_env.step(action)
 
-            next_instance_obs = {
-                'p_node_id': p_node_id,
-                #'hidden_state': hidden_state.squeeze(0).cpu().detach().numpy(),  #Remove
-                'encoder_outputs': encoder_outputs,
-                'p_net_x': next_instance_obs['p_net_x'],
-                'p_net_edge_index': next_instance_obs['p_net_edge_index'],
-                'action_mask': np.expand_dims(sub_env.generate_action_mask(), axis=0)
-            }
-            if instance_done:
-                break
+            # Store rollout info
+            sub_buffer.add(instance_obs, action, reward, instance_done, action_logprob, value=value)
 
-            instance_obs = next_instance_obs
+            # Update partial sequence
+            history_actions.append(action)
 
-        last_value = self.estimate_value(self.preprocess_obs(next_instance_obs, self.device)) if hasattr(self.policy, 'evaluate') else None
-        solution = sub_env.solution
-        return solution, sub_buffer, last_value
+            # Move on
+            if not instance_done:
+                encoder_obs = next_obs
+
+        # Final value for GAE or advantage bootstrapping
+        last_value = 0.
+        if hasattr(self.policy, 'evaluate'):
+            next_tensor_obs = self.preprocess_obs(
+                {
+                    'p_net_x'          : encoder_obs['p_net_x'],
+                    'p_net_edge_index' : encoder_obs['p_net_edge_index'],
+                    'history_actions'  : np.array(history_actions, dtype=np.int64),
+                    'encoder_outputs'  : encoder_outputs,
+                    'action_mask'      : np.expand_dims(sub_env.generate_action_mask(), axis=0)
+                },
+                device=self.device
+            )
+            last_value = self.estimate_value(next_tensor_obs)
+
+        return sub_env.solution, sub_buffer, last_value
 
 
 def make_policy(agent, **kwargs):
+    # Same as before, but we will finalize the critic in net.py with a value head.
     action_dim = agent.p_net_setting_num_nodes
     feature_dim = agent.p_net_setting_num_node_resource_attrs + agent.p_net_setting_num_link_resource_attrs + 5
+
     policy = ActorCritic(
         p_net_num_nodes=action_dim,
         p_net_feature_dim=5,
         v_net_feature_dim=2,
         embedding_dim=agent.embedding_dim
     ).to(agent.device)
+
     optimizer = torch.optim.Adam([
         {'params': policy.encoder.parameters(), 'lr': agent.lr_actor},
-        {'params': policy.actor.parameters(), 'lr': agent.lr_actor},
-        {'params': policy.critic.parameters(), 'lr': agent.lr_critic}
+        {'params': policy.actor.parameters(),   'lr': agent.lr_actor},
+        {'params': policy.critic.parameters(),  'lr': agent.lr_critic}
     ], weight_decay=agent.weight_decay)
     return policy, optimizer
 
 
 def encoder_obs_to_tensor(obs, device):
-    # one
+    """Process the SFC/v_net features for the Transformer Encoder."""
     if isinstance(obs, dict):
-        """Preprocess the observation to adapt to batch mode."""
-        v_net_x = obs['v_net_x'] 
-        obs_v_net_x = torch.FloatTensor(v_net_x).unsqueeze(dim=0).to(device) 
-
+        v_net_x = obs['v_net_x']
+        # shape => (seq_len, v_net_feature_dim)
+        obs_v_net_x = torch.FloatTensor(v_net_x).unsqueeze(0).to(device) 
         return {'v_net_x': obs_v_net_x}
     elif isinstance(obs, list):
-        obs_batch = obs
-        v_net_x_list = []
-        for observation in obs:
-            v_net_x = obs['v_net_x']
-            v_net_x_list.append(v_net_x)
-        obs_v_net_x = torch.FloatTensor(np.array(v_net_x_list)).to(device)
-        return {'v_net_x': obs_v_net_x}
+        # Handling a batch of obs
+        obs_batch = []
+        for o in obs:
+            v_net_x = torch.FloatTensor(o['v_net_x']).to(device)
+            obs_batch.append(v_net_x)
+
+        # Pad them along seq dimension
+        # [BatchSize, MaxSeqLen, FeatureDim]
+        padded = pad_sequence(obs_batch, batch_first=True)
+        return {'v_net_x': padded}
     else:
         raise Exception(f"Unrecognized type of observation {type(obs)}")
 
+
 def obs_as_tensor(obs, device):
-    # one
+    """Preprocess the entire observation (including partial action sequence) into tensor form."""
     if isinstance(obs, dict):
-        """Preprocess the observation to adapt to batch mode (single sample)."""
+        # Single sample
         data = get_pyg_data(obs['p_net_x'], obs['p_net_edge_index'])
         obs_p_net = Batch.from_data_list([data]).to(device)
 
-        obs_p_node_id = torch.LongTensor([obs['p_node_id']]).to(device)
+        # The full partial action sequence (history)
+        history_actions = obs['history_actions']  # shape (t,)
+        history_actions = torch.LongTensor(history_actions).unsqueeze(0).to(device)  # => (1, t)
+
         obs_encoder_outputs = torch.as_tensor(obs['encoder_outputs'], dtype=torch.float32, device=device)
-        obs_action_mask = torch.as_tensor(obs['action_mask'], dtype=torch.float32, device=device)
+        obs_action_mask     = torch.as_tensor(obs['action_mask'],     dtype=torch.float32, device=device)
 
         return {
-            'p_net': obs_p_net,
-            'p_node_id': obs_p_node_id,
-            'encoder_outputs': obs_encoder_outputs,
-            'action_mask': obs_action_mask,
-            'mask': None  # No padding mask needed for single sample
+            'p_net'           : obs_p_net,
+            'history_actions' : history_actions,  # shape (1, t)
+            'encoder_outputs' : obs_encoder_outputs,  # shape (1, seq_len, emb)
+            'action_mask'     : obs_action_mask,
+            'mask'            : None
         }
 
-    # batch
     elif isinstance(obs, list):
-        obs_batch = obs
-
-        p_net_data_list = []
-        p_node_id_list  = []
+        # Batch of samples
+        p_net_data_list      = []
+        history_actions_list = []
         encoder_outputs_list = []
-        action_mask_list = []
+        action_mask_list     = []
 
-        for observation in obs_batch:
-            p_net_data = get_pyg_data(observation['p_net_x'], observation['p_net_edge_index'])
-            p_node_id  = observation['p_node_id']
-            encoder_outputs = observation['encoder_outputs']
-            action_mask = observation['action_mask']
+        for o in obs:
+            data = get_pyg_data(o['p_net_x'], o['p_net_edge_index'])
+            p_net_data_list.append(data)
 
-            p_net_data_list.append(p_net_data)
-            p_node_id_list.append(p_node_id)
-            encoder_outputs_list.append(encoder_outputs)
-            action_mask_list.append(action_mask)
+            ha = torch.LongTensor(o['history_actions'])
+            history_actions_list.append(ha)
+            encoder_outputs_list.append(o['encoder_outputs'])
+            action_mask_list.append(o['action_mask'])
 
         obs_p_net = Batch.from_data_list(p_net_data_list).to(device)
-        obs_p_node_id = torch.LongTensor(np.array(p_node_id_list)).to(device)
-        obs_action_mask = torch.as_tensor(np.array(action_mask_list), dtype=torch.float32, device=device)
-        
 
-        # Pad sequences with zeros and get the mask of padded elements 
-        sequences = encoder_outputs_list   
-        max_length = max([seq.shape[1] for seq in sequences])   
-        feat_dim = sequences[0].shape[2]   
-  
-        # Print every sequence's original shape
-        #for i, seq in enumerate(sequences):
-        #    print(f"Sequence {i} original shape: {seq.shape}")
+        # Pad history_actions
+        hist_padded = pad_sequence(history_actions_list, batch_first=True, padding_value=0).to(device)
 
-        # Create padded tensors with correct shape
-        padded_sequences = torch.zeros(
-            (len(sequences), max_length, feat_dim),  # (batch_size, seq_len, feat_dim)
-            device=device,
-            dtype=torch.float32
-        )
-        mask = torch.zeros(
-            (len(sequences), max_length),
-            device=device,
-            dtype=torch.bool
-        )
+        # Convert encoder outputs to a single padded tensor
+        # Suppose each is (1, seq_len, emb). We'll find max seq_len among them
+        # for simplicity. We'll do a naive approach:
+        batch_size  = len(encoder_outputs_list)
+        max_seq_len = max(eo.shape[1] for eo in encoder_outputs_list)
+        emb_dim     = encoder_outputs_list[0].shape[2]
 
-        #torch.Size([1, 8, 128])  # (batch_size=1, seq_len=8, embed_dim=128)
-        # Fill the padded sequences
-        for i, seq in enumerate(sequences): 
-            seq = seq.to(device, dtype=torch.float32)  # Remove first dim
-            #seq = seq.squeeze(0)
-            seq_len = seq.shape[1]  # Now should be seq length for padding 
+        enc_padded = torch.zeros((batch_size, max_seq_len, emb_dim), dtype=torch.float32, device=device)
+        for i, eo in enumerate(encoder_outputs_list):
+            slen = eo.shape[1]
+            enc_padded[i, :slen, :] = torch.as_tensor(eo, device=device)
 
-            padded_sequences[i, :seq_len, :] = seq  # Assign correctly
-            mask[i, :seq_len] = True  # Set mask
-
-        obs_encoder_outputs = padded_sequences
-        obs_mask = mask
+        act_mask_t = torch.as_tensor(action_mask_list, dtype=torch.float32, device=device)
 
         return {
-            'p_net': obs_p_net,
-            'p_node_id': obs_p_node_id,
-            'encoder_outputs': obs_encoder_outputs,
-            'mask': obs_mask,
-            'action_mask': obs_action_mask
+            'p_net'           : obs_p_net,
+            'history_actions' : hist_padded,       # (batch_size, max_hist_len)
+            'encoder_outputs' : enc_padded,        # (batch_size, max_seq_len, emb_dim)
+            'action_mask'     : act_mask_t,
+            'mask'            : None
         }
 
     else:
