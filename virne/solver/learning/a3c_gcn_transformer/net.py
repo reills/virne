@@ -150,7 +150,7 @@ class AutoregressiveDecoder(nn.Module):
         # GCN to embed the physical nodes
         self.gcn = GCNConvNet(
             input_dim=p_net_feature_dim,
-            hidden_dim=embedding_dim,
+            output_dim=embedding_dim,  # added output_dim
             embedding_dim=embedding_dim,
             dropout_prob=0.,
             return_batch=True
