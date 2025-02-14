@@ -235,7 +235,9 @@ def obs_as_tensor(obs, device):
             slen = eo.shape[1]
             enc_padded[i, :slen, :] = torch.as_tensor(eo, device=device)
 
-        act_mask_t = torch.as_tensor(action_mask_list, dtype=torch.float32, device=device)
+        #creating a PyTorch tensor directly from a list of NumPy arrays can be slow
+        action_mask_array = np.array(action_mask_list)
+        act_mask_t = torch.as_tensor(action_mask_array, dtype=torch.float32, device=device) 
 
         return {
             'p_net'           : obs_p_net,
